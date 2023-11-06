@@ -512,11 +512,17 @@ export async function build(
     await initDepsOptimizer(config)
   }
 
+  const format = (Array.isArray(options.rollupOptions)
+    ? options.rollupOptions[0]
+    : options.rollupOptions)?.output?.format as InternalModuleFormat
+
   const rollupOptions: RollupOptions = {
     preserveEntrySignatures: ssr
       ? 'allow-extension'
       : libOptions
       ? 'strict'
+      : format === 'umd'
+      ? 'allow-extension'
       : false,
     cache: config.build.watch ? undefined : false,
     ...options.rollupOptions,
@@ -565,13 +571,18 @@ export async function build(
                 .type,
             )
           : 'js'
+      const outputName = Array.isArray(options.rollupOptions.output)
+        ? options.rollupOptions.output.map((o) => o.name).filter(Boolean)[0]
+        : options.rollupOptions.output?.name
+      const resultName = libOptions ? libOptions.name : outputName || undefined
+
       return {
         dir: outDir,
         // Default format is 'es' for regular and for SSR builds
         format,
         exports: 'auto',
         sourcemap: options.sourcemap,
-        name: libOptions ? libOptions.name : undefined,
+        name: resultName,
         // es2015 enables `generatedCode.symbols`
         // - #764 add `Symbol.toStringTag` when build es module into cjs chunk
         // - #1048 add `Symbol.toStringTag` for module default export
