@@ -3,7 +3,11 @@ import path from 'node:path'
 import { performance } from 'node:perf_hooks'
 import colors from 'picocolors'
 import MagicString from 'magic-string'
-import type { ExportSpecifier, ImportSpecifier } from 'es-module-lexer'
+import type {
+  ParseError as EsModuleLexerParseError,
+  ExportSpecifier,
+  ImportSpecifier,
+} from 'es-module-lexer'
 import { init, parse as parseImports } from 'es-module-lexer'
 import { parse as parseJS } from 'acorn'
 import type { Node } from 'estree'
@@ -58,6 +62,7 @@ import { throwOutdatedRequest } from './optimizedDeps'
 import { isCSSRequest, isDirectCSSRequest } from './css'
 import { browserExternalId } from './resolve'
 import { serializeDefine } from './define'
+import { WORKER_FILE_ID } from './worker'
 
 const debug = createDebugger('vite:import-analysis')
 
@@ -74,7 +79,6 @@ const hasImportInQueryParamsRE = /[?&]import=?\b/
 
 export const hasViteIgnoreRE = /\/\*\s*@vite-ignore\s*\*\//
 
-const cleanUpRawUrlRE = /\/\*[\s\S]*?\*\/|([^\\:]|^)\/\/.*$/gm
 const urlIsStringRE = /^(?:'.*'|".*"|`.*`)$/
 
 const templateLiteralRE = /^\s*`(.*)`\s*$/
@@ -228,7 +232,8 @@ export function importAnalysisPlugin(config: ResolvedConfig): Plugin {
       source = stripBomTag(source)
       try {
         ;[imports, exports] = parseImports(source)
-      } catch (e: any) {
+      } catch (_e: unknown) {
+        const e = _e as EsModuleLexerParseError
         const { message, showCodeFrame } = createParseErrorInfo(
           importer,
           source,
@@ -650,16 +655,15 @@ export function importAnalysisPlugin(config: ResolvedConfig): Plugin {
             }
 
             if (!ssr) {
-              const url = rawUrl.replace(cleanUpRawUrlRE, '').trim()
               if (
-                !urlIsStringRE.test(url) ||
-                isExplicitImportRequired(url.slice(1, -1))
+                !urlIsStringRE.test(rawUrl) ||
+                isExplicitImportRequired(rawUrl.slice(1, -1))
               ) {
                 needQueryInjectHelper = true
                 str().overwrite(
                   start,
                   end,
-                  `__vite__injectQuery(${url}, 'import')`,
+                  `__vite__injectQuery(${rawUrl}, 'import')`,
                   { contentOnly: true },
                 )
               }
@@ -677,12 +681,17 @@ export function importAnalysisPlugin(config: ResolvedConfig): Plugin {
       const acceptedUrls = mergeAcceptedUrls(orderedAcceptedUrls)
       const acceptedExports = mergeAcceptedUrls(orderedAcceptedExports)
 
-      if (hasEnv) {
+      // While we always expect to work with ESM, a classic worker is the only
+      // case where it's not ESM and we need to avoid injecting ESM-specific code
+      const isClassicWorker =
+        importer.includes(WORKER_FILE_ID) && importer.includes('type=classic')
+
+      if (hasEnv && !isClassicWorker) {
         // inject import.meta.env
         str().prepend(getEnv(ssr))
       }
 
-      if (hasHMR && !ssr) {
+      if (hasHMR && !ssr && !isClassicWorker) {
         debugHmr?.(
           `${
             isSelfAccepting
@@ -704,9 +713,13 @@ export function importAnalysisPlugin(config: ResolvedConfig): Plugin {
       }
 
       if (needQueryInjectHelper) {
-        str().prepend(
-          `import { injectQuery as __vite__injectQuery } from "${clientPublicPath}";`,
-        )
+        if (isClassicWorker) {
+          str().append('\n' + __vite__injectQuery.toString())
+        } else {
+          str().prepend(
+            `import { injectQuery as __vite__injectQuery } from "${clientPublicPath}";`,
+          )
+        }
       }
 
       // normalize and rewrite accepted urls
@@ -1000,4 +1013,20 @@ export function transformCjsImport(
 
     return lines.join('; ')
   }
+}
+
+// Copied from `client/client.ts`. Only needed so we can inline inject this function for classic workers.
+function __vite__injectQuery(url: string, queryToInject: string): string {
+  // skip urls that won't be handled by vite
+  if (url[0] !== '.' && url[0] !== '/') {
+    return url
+  }
+
+  // can't use pathname from URL since it may be relative like ../
+  const pathname = url.replace(/[?#].*$/s, '')
+  const { search, hash } = new URL(url, 'http://vitejs.dev')
+
+  return `${pathname}?${queryToInject}${search ? `&` + search.slice(1) : ''}${
+    hash || ''
+  }`
 }
